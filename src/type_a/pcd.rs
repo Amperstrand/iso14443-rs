@@ -8,7 +8,6 @@
 //! directions, WTX handling, error recovery, and DESELECT.
 
 use super::{
-    Block, Cid, Frame, PcdTransceiver, TypeAError,
     ats::Ats,
     crc::append_crc_a,
     pcb::{BlockType, SBlockSubtype},
@@ -16,6 +15,7 @@ use super::{
     protocol::{Action, ProtocolHandler},
     rats::{Fsdi, RatsParam},
     vec::{ChainVec, FrameVec, VecExt},
+    Block, Cid, Frame, PcdTransceiver, TypeAError,
 };
 
 const MAX_RETRIES: u8 = 2;

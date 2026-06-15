@@ -1,4 +1,4 @@
-use super::{TypeAError, crc::crc_a};
+use super::{crc::crc_a, TypeAError};
 
 /// Table 8 - Coding of SAK
 #[derive(Debug, Clone)]
