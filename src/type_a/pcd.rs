@@ -137,15 +137,20 @@ fn transceive_with_recovery_with<T: PcdTransceiver>(
                 }
                 retries += 1;
 
-                let recovery = if receiving_chain {
-                    handler.build_rack()?
+                if receiving_chain {
+                    // ISO 14443-4 §7.5.5 Rule 5: re-send the same R(ACK).
+                    // block_number was already toggled by process_iblock, so build_rack()
+                    // would produce wrong BN → card retransmits wrong I-block → duplicate data.
+                    match transceive_block_with(t, hw_crc, block) {
+                        Ok(resp) => return Ok(resp),
+                        Err(_) => continue,
+                    }
                 } else {
-                    handler.build_rnak()?
-                };
-
-                match transceive_block_with(t, hw_crc, &recovery) {
-                    Ok(resp) => return Ok(resp),
-                    Err(_) => continue,
+                    let recovery = handler.build_rnak()?;
+                    match transceive_block_with(t, hw_crc, &recovery) {
+                        Ok(resp) => return Ok(resp),
+                        Err(_) => continue,
+                    }
                 }
             }
         }
