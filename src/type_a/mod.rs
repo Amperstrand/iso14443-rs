@@ -51,6 +51,17 @@ pub trait PcdTransceiver {
     ///   compute and append CRC_A in software (via `crc::append_crc_a`) and
     ///   validate it on received frames.
     fn try_enable_hw_crc(&mut self) -> Result<(), Self::Error>;
+
+    /// Extend the receive timeout for S(WTX) exchanges.
+    ///
+    /// Called before sending an S(WTX) echo to give the card the additional
+    /// processing time it requested (ISO 14443-4 §7.5.7).  The default
+    /// implementation is a no-op; hardware transceivers should override it.
+    ///
+    /// Returns `Ok(())` if the timeout was updated, `Err(())` otherwise.
+    fn try_set_timeout_ms(&mut self, _ms: u32) -> Result<(), ()> {
+        Err(())
+    }
 }
 
 /// Trait for ISO14443 Type A PICC (card emulation) transceiver hardware.

@@ -44,6 +44,7 @@ pub struct PcdSession {
     hw_crc: bool,
     fsc: usize,
     handler: ProtocolHandler,
+    base_fwt_ms: u32,
 }
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ pub struct Pcd<'t, T: PcdTransceiver> {
     hw_crc: bool,
     fsc: usize,
     handler: ProtocolHandler,
+    base_fwt_ms: u32,
 }
 
 fn connect_session<T: PcdTransceiver>(
@@ -154,6 +156,7 @@ fn collect_response_with<T: PcdTransceiver>(
     t: &mut T,
     handler: &mut ProtocolHandler,
     hw_crc: bool,
+    base_fwt_ms: u32,
     first: Block,
 ) -> Result<ChainVec, PcdError<T::Error>> {
     let mut block = first;
@@ -162,7 +165,17 @@ fn collect_response_with<T: PcdTransceiver>(
         match handler.process_received(block)? {
             Action::Complete(data) => return Ok(data),
             Action::Reply(reply) => {
+                let is_wtx = reply.block_type() == BlockType::SBlock
+                    && reply.pcb.s_subtype == Some(SBlockSubtype::Wtx);
+                if is_wtx && base_fwt_ms > 0 {
+                    let wtxm = reply.payload.as_slice().first().copied().unwrap_or(1) as u32;
+                    let extended = (wtxm * base_fwt_ms).max(base_fwt_ms);
+                    let _ = t.try_set_timeout_ms(extended);
+                }
                 block = transceive_with_recovery_with(t, handler, hw_crc, &reply, true)?;
+                if is_wtx && base_fwt_ms > 0 {
+                    let _ = t.try_set_timeout_ms(base_fwt_ms);
+                }
             }
             _ => return Err(PcdError::Protocol(TypeAError::Other)),
         }
@@ -174,6 +187,7 @@ fn exchange_session<T: PcdTransceiver>(
     handler: &mut ProtocolHandler,
     hw_crc: bool,
     fsc: usize,
+    base_fwt_ms: u32,
     apdu: &[u8],
 ) -> Result<ChainVec, PcdError<T::Error>> {
     handler.reset_chain();
@@ -214,7 +228,7 @@ fn exchange_session<T: PcdTransceiver>(
     }
 
     let first = last_resp.ok_or(PcdError::Protocol(TypeAError::Other))?;
-    collect_response_with(t, handler, hw_crc, first)
+    collect_response_with(t, handler, hw_crc, base_fwt_ms, first)
 }
 
 fn deselect_session<T: PcdTransceiver>(
@@ -258,7 +272,12 @@ impl PcdSession {
             hw_crc,
             fsc: ats.format.fsci.fsc(),
             handler: ProtocolHandler::new(cid),
+            base_fwt_ms: 0,
         }
+    }
+
+    pub fn set_base_fwt_ms(&mut self, ms: u32) {
+        self.base_fwt_ms = ms;
     }
 
     pub fn set_fsc(&mut self, fsc: usize) {
@@ -270,7 +289,14 @@ impl PcdSession {
         t: &mut T,
         apdu: &[u8],
     ) -> Result<ChainVec, PcdError<T::Error>> {
-        exchange_session(t, &mut self.handler, self.hw_crc, self.fsc, apdu)
+        exchange_session(
+            t,
+            &mut self.handler,
+            self.hw_crc,
+            self.fsc,
+            self.base_fwt_ms,
+            apdu,
+        )
     }
 
     pub fn deselect<T: PcdTransceiver>(&mut self, t: &mut T) -> Result<(), PcdError<T::Error>> {
@@ -298,6 +324,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
                 hw_crc: session.hw_crc,
                 fsc: session.fsc,
                 handler: session.handler,
+                base_fwt_ms: session.base_fwt_ms,
             },
             ats,
         ))
@@ -312,6 +339,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
             hw_crc: session.hw_crc,
             fsc: session.fsc,
             handler: session.handler,
+            base_fwt_ms: session.base_fwt_ms,
         }
     }
 
@@ -366,6 +394,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
             &mut self.handler,
             self.hw_crc,
             self.fsc,
+            self.base_fwt_ms,
             apdu,
         )
     }
@@ -383,6 +412,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
             self.transceiver,
             &mut self.handler,
             self.hw_crc,
+            self.base_fwt_ms,
             first,
         )
     }
