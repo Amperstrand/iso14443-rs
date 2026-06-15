@@ -256,6 +256,26 @@ impl TryFrom<u8> for Tb {
 #[derive(Default, Clone)]
 pub struct Sfgi(pub(crate) u8);
 
+impl Sfgi {
+    /// Returns the raw SFGI value (0–14).
+    pub fn value(&self) -> u8 {
+        self.0
+    }
+
+    /// Compute SFGT in microseconds per ISO 14443-4 §5.2.5.
+    /// Returns 0 when SFGI is 0 (no guard time needed).
+    pub fn sfgt_us(&self) -> u64 {
+        if self.0 == 0 {
+            0
+        } else {
+            // SFGT = (256 × 16 / fc) × 2^SFGI,  fc = 13.56 MHz
+            // (256 × 16 / 13.56) ≈ 302.06 µs
+            // Round to nearest integer: 302 µs × 2^SFGI
+            302u64 * (1u64 << self.0)
+        }
+    }
+}
+
 /// SFGI is coded in the range from 0 to 14.
 impl TryFrom<u8> for Sfgi {
     type Error = TypeAError;
@@ -298,6 +318,12 @@ impl fmt::Debug for Sfgi {
 
 #[derive(Clone)]
 pub struct Fwi(pub(crate) u8);
+
+impl Fwi {
+    pub fn value(&self) -> u8 {
+        self.0
+    }
+}
 
 impl TryFrom<u8> for Fwi {
     type Error = TypeAError;

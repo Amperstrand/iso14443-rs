@@ -251,7 +251,7 @@ impl TryFrom<&[u8]> for Command {
 pub use ats::{Fsci, Fwi, Sfgi, Ta, Tb, Tc};
 pub use block::Block;
 pub use pcb::{BlockType, Pcb, PcbFlags, RBlockSubtype, SBlockSubtype};
-pub use pcd::{Pcd, PcdError};
+pub use pcd::{Pcd, PcdError, PcdSession};
 pub use picc::{Picc, PiccConfig, PiccError, Uid};
 pub use pps::Dxi;
 pub use protocol::{Action, ProtocolHandler};

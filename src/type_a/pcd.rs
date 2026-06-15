@@ -40,55 +40,264 @@ impl<E> From<TypeAError> for PcdError<E> {
 /// Tracks protocol state for a single activated PICC: CRC strategy,
 /// negotiated frame size, and the generic block protocol handler.
 #[derive(Debug)]
+pub struct PcdSession {
+    hw_crc: bool,
+    fsc: usize,
+    handler: ProtocolHandler,
+}
+
+#[derive(Debug)]
 pub struct Pcd<'t, T: PcdTransceiver> {
     transceiver: &'t mut T,
     hw_crc: bool,
-    /// Maximum frame size the PICC accepts (from ATS FSCI).
     fsc: usize,
     handler: ProtocolHandler,
+}
+
+fn connect_session<T: PcdTransceiver>(
+    t: &mut T,
+    fsdi: Fsdi,
+    cid: Cid,
+) -> Result<(PcdSession, Ats), PcdError<T::Error>> {
+    let hw_crc = t.try_enable_hw_crc().is_ok();
+
+    let rats = RatsParam::new(fsdi, cid);
+    let rats_byte = u8::from(&rats);
+    let data = if hw_crc {
+        let mut v = FrameVec::new();
+        v.try_push(0xe0)?;
+        v.try_push(rats_byte)?;
+        v
+    } else {
+        append_crc_a(&[0xe0, rats_byte])?
+    };
+
+    let resp = t
+        .transceive(&Frame::Standard(data))
+        .map_err(PcdError::PcdTransceiver)?;
+
+    let ats = if hw_crc {
+        let mut buf = FrameVec::new();
+        buf.try_extend(resp.as_slice())?;
+        buf.try_push(0)?;
+        buf.try_push(0)?;
+        Ats::try_from(buf.as_slice())?
+    } else {
+        Ats::try_from(resp.as_slice())?
+    };
+
+    Ok((PcdSession::from_ats(&ats, Some(cid), hw_crc), ats))
+}
+
+fn parse_block_response<E>(hw_crc: bool, raw: &[u8]) -> Result<Block, PcdError<E>> {
+    if hw_crc {
+        let mut buf = FrameVec::new();
+        buf.try_extend(raw)?;
+        buf.try_push(0)?;
+        buf.try_push(0)?;
+        Ok(Block::try_from(buf.as_slice())?)
+    } else {
+        Ok(Block::try_from(raw)?)
+    }
+}
+
+fn transceive_block_with<T: PcdTransceiver>(
+    t: &mut T,
+    hw_crc: bool,
+    block: &Block,
+) -> Result<Block, PcdError<T::Error>> {
+    let data = block.to_bytes_without_crc()?;
+    let frame = if hw_crc {
+        Frame::Standard(data)
+    } else {
+        Frame::Standard(append_crc_a(&data)?)
+    };
+
+    let resp = t.transceive(&frame).map_err(PcdError::PcdTransceiver)?;
+
+    parse_block_response(hw_crc, &resp)
+}
+
+fn transceive_with_recovery_with<T: PcdTransceiver>(
+    t: &mut T,
+    handler: &mut ProtocolHandler,
+    hw_crc: bool,
+    block: &Block,
+    receiving_chain: bool,
+) -> Result<Block, PcdError<T::Error>> {
+    match transceive_block_with(t, hw_crc, block) {
+        Ok(resp) => Ok(resp),
+        Err(_) => {
+            let mut retries = 0;
+            loop {
+                if retries >= MAX_RETRIES {
+                    return Err(PcdError::Protocol(TypeAError::Other));
+                }
+                retries += 1;
+
+                let recovery = if receiving_chain {
+                    handler.build_rack()?
+                } else {
+                    handler.build_rnak()?
+                };
+
+                match transceive_block_with(t, hw_crc, &recovery) {
+                    Ok(resp) => return Ok(resp),
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+}
+
+fn collect_response_with<T: PcdTransceiver>(
+    t: &mut T,
+    handler: &mut ProtocolHandler,
+    hw_crc: bool,
+    first: Block,
+) -> Result<ChainVec, PcdError<T::Error>> {
+    let mut block = first;
+
+    loop {
+        match handler.process_received(block)? {
+            Action::Complete(data) => return Ok(data),
+            Action::Reply(reply) => {
+                block = transceive_with_recovery_with(t, handler, hw_crc, &reply, true)?;
+            }
+            _ => return Err(PcdError::Protocol(TypeAError::Other)),
+        }
+    }
+}
+
+fn exchange_session<T: PcdTransceiver>(
+    t: &mut T,
+    handler: &mut ProtocolHandler,
+    hw_crc: bool,
+    fsc: usize,
+    apdu: &[u8],
+) -> Result<ChainVec, PcdError<T::Error>> {
+    handler.reset_chain();
+
+    let cid_len = if handler.build_iblock(&[], false)?.cid.is_some() {
+        1
+    } else {
+        0
+    };
+    let overhead = 1 + cid_len + 2;
+    let max_inf = fsc.saturating_sub(overhead);
+    if max_inf == 0 {
+        return Err(PcdError::Protocol(TypeAError::Other));
+    }
+
+    let mut offset = 0;
+    let mut last_resp: Option<Block> = None;
+
+    while offset < apdu.len() {
+        let end = core::cmp::min(offset + max_inf, apdu.len());
+        let chaining = end < apdu.len();
+        let iblock = handler.build_iblock(&apdu[offset..end], chaining)?;
+
+        let resp = transceive_block_with(t, hw_crc, &iblock)?;
+
+        if chaining {
+            match handler.process_received(resp)? {
+                Action::ChainingAck => {
+                    offset = end;
+                }
+                Action::ChainingRetransmit => continue,
+                _ => return Err(PcdError::Protocol(TypeAError::Other)),
+            }
+        } else {
+            last_resp = Some(resp);
+            offset = end;
+        }
+    }
+
+    let first = last_resp.ok_or(PcdError::Protocol(TypeAError::Other))?;
+    collect_response_with(t, handler, hw_crc, first)
+}
+
+fn deselect_session<T: PcdTransceiver>(
+    t: &mut T,
+    handler: &mut ProtocolHandler,
+    hw_crc: bool,
+) -> Result<(), PcdError<T::Error>> {
+    let deselect = handler.build_sblock(SBlockSubtype::Deselect)?;
+
+    match transceive_block_with(t, hw_crc, &deselect) {
+        Ok(ref resp)
+            if resp.block_type() == BlockType::SBlock
+                && resp.pcb.s_subtype == Some(SBlockSubtype::Deselect) =>
+        {
+            Ok(())
+        }
+        _ => {
+            let resp = transceive_block_with(t, hw_crc, &deselect)?;
+            if resp.block_type() == BlockType::SBlock
+                && resp.pcb.s_subtype == Some(SBlockSubtype::Deselect)
+            {
+                Ok(())
+            } else {
+                Err(PcdError::Protocol(TypeAError::Other))
+            }
+        }
+    }
+}
+
+impl PcdSession {
+    pub fn from_connect<T: PcdTransceiver>(
+        t: &mut T,
+        fsdi: Fsdi,
+        cid: Cid,
+    ) -> Result<(Self, Ats), PcdError<T::Error>> {
+        connect_session(t, fsdi, cid)
+    }
+
+    pub fn from_ats(ats: &Ats, cid: Option<Cid>, hw_crc: bool) -> Self {
+        Self {
+            hw_crc,
+            fsc: ats.format.fsci.fsc(),
+            handler: ProtocolHandler::new(cid),
+        }
+    }
+
+    pub fn set_fsc(&mut self, fsc: usize) {
+        self.fsc = fsc;
+    }
+
+    pub fn exchange<T: PcdTransceiver>(
+        &mut self,
+        t: &mut T,
+        apdu: &[u8],
+    ) -> Result<ChainVec, PcdError<T::Error>> {
+        exchange_session(t, &mut self.handler, self.hw_crc, self.fsc, apdu)
+    }
+
+    pub fn deselect<T: PcdTransceiver>(&mut self, t: &mut T) -> Result<(), PcdError<T::Error>> {
+        deselect_session(t, &mut self.handler, self.hw_crc)
+    }
+
+    pub fn hw_crc(&self) -> bool {
+        self.hw_crc
+    }
+
+    pub fn fsc(&self) -> usize {
+        self.fsc
+    }
 }
 
 impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// Full setup: probe hardware CRC, send RATS, parse ATS, return a
     /// ready session and the parsed ATS for inspection.
     pub fn connect(t: &'t mut T, fsdi: Fsdi, cid: Cid) -> Result<(Self, Ats), PcdError<T::Error>> {
-        let hw_crc = t.try_enable_hw_crc().is_ok();
-
-        // Build and send RATS
-        let rats = RatsParam::new(fsdi, cid);
-        let rats_byte = u8::from(&rats);
-        let data = if hw_crc {
-            let mut v = FrameVec::new();
-            v.try_push(0xe0)?;
-            v.try_push(rats_byte)?;
-            v
-        } else {
-            append_crc_a(&[0xe0, rats_byte])?
-        };
-
-        let resp = t
-            .transceive(&Frame::Standard(data))
-            .map_err(PcdError::PcdTransceiver)?;
-
-        // Parse ATS — append fake CRC for hw_crc path
-        let ats = if hw_crc {
-            let mut buf = FrameVec::new();
-            buf.try_extend(resp.as_slice())?;
-            buf.try_push(0)?;
-            buf.try_push(0)?;
-            Ats::try_from(buf.as_slice())?
-        } else {
-            Ats::try_from(resp.as_slice())?
-        };
-
-        let fsc = ats.format.fsci.fsc();
+        let (session, ats) = connect_session(t, fsdi, cid)?;
 
         Ok((
             Self {
                 transceiver: t,
-                hw_crc,
-                fsc,
-                handler: ProtocolHandler::new(Some(cid)),
+                hw_crc: session.hw_crc,
+                fsc: session.fsc,
+                handler: session.handler,
             },
             ats,
         ))
@@ -97,11 +306,12 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// Manual setup for callers who have already handled RATS/ATS
     /// externally (e.g. via the CLI parser).
     pub fn new(transceiver: &'t mut T, ats: &Ats, cid: Option<Cid>, hw_crc: bool) -> Self {
+        let session = PcdSession::from_ats(ats, cid, hw_crc);
         Self {
             transceiver,
-            hw_crc,
-            fsc: ats.format.fsci.fsc(),
-            handler: ProtocolHandler::new(cid),
+            hw_crc: session.hw_crc,
+            fsc: session.fsc,
+            handler: session.handler,
         }
     }
 
@@ -151,95 +361,30 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// Handles chaining in both directions, S(WTX) responses, and error
     /// recovery per ISO14443-4 §7.5.
     pub fn exchange(&mut self, apdu: &[u8]) -> Result<ChainVec, PcdError<T::Error>> {
-        self.handler.reset_chain();
-
-        // Max payload per I-Block: FSC minus prologue (PCB + optional CID)
-        // minus epilogue (2-byte CRC).
-        let cid_len = if self.handler.build_iblock(&[], false)?.cid.is_some() {
-            1
-        } else {
-            0
-        };
-        let overhead = 1 + cid_len + 2;
-        let max_inf = self.fsc.saturating_sub(overhead);
-        if max_inf == 0 {
-            return Err(PcdError::Protocol(TypeAError::Other));
-        }
-
-        let mut offset = 0;
-        let mut last_resp: Option<Block> = None;
-
-        // --- PCD-side chaining (send APDU) ---
-        while offset < apdu.len() {
-            let end = core::cmp::min(offset + max_inf, apdu.len());
-            let chaining = end < apdu.len();
-            let iblock = self.handler.build_iblock(&apdu[offset..end], chaining)?;
-
-            let resp = self.transceive_block(&iblock)?;
-
-            if chaining {
-                match self.handler.process_received(resp)? {
-                    Action::ChainingAck => {
-                        offset = end;
-                    }
-                    Action::ChainingRetransmit => {
-                        // Retransmit same chunk (don't advance offset)
-                        continue;
-                    }
-                    _ => return Err(PcdError::Protocol(TypeAError::Other)),
-                }
-            } else {
-                self.handler.toggle_block_number();
-                last_resp = Some(resp);
-                offset = end;
-            }
-        }
-
-        // --- PICC-side chaining (receive response) ---
-        let first = last_resp.ok_or(PcdError::Protocol(TypeAError::Other))?;
-        self.collect_response(first)
+        exchange_session(
+            self.transceiver,
+            &mut self.handler,
+            self.hw_crc,
+            self.fsc,
+            apdu,
+        )
     }
 
     /// Send S(DESELECT), wait for response. Retries once per Rule 8.
     pub fn deselect(&mut self) -> Result<(), PcdError<T::Error>> {
-        let deselect = self.handler.build_sblock(SBlockSubtype::Deselect)?;
-
-        match self.transceive_block(&deselect) {
-            Ok(ref resp)
-                if resp.block_type() == BlockType::SBlock
-                    && resp.pcb.s_subtype == Some(SBlockSubtype::Deselect) =>
-            {
-                Ok(())
-            }
-            _ => {
-                // Rule 8: retry once
-                let resp = self.transceive_block(&deselect)?;
-                if resp.block_type() == BlockType::SBlock
-                    && resp.pcb.s_subtype == Some(SBlockSubtype::Deselect)
-                {
-                    Ok(())
-                } else {
-                    Err(PcdError::Protocol(TypeAError::Other))
-                }
-            }
-        }
+        deselect_session(self.transceiver, &mut self.handler, self.hw_crc)
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Collect the full PICC response, handling chaining, WTX, and errors.
     fn collect_response(&mut self, first: Block) -> Result<ChainVec, PcdError<T::Error>> {
-        let mut block = first;
-
-        loop {
-            match self.handler.process_received(block)? {
-                Action::Complete(data) => return Ok(data),
-                Action::Reply(reply) => {
-                    block = self.transceive_with_recovery(&reply, true)?;
-                }
-                _ => return Err(PcdError::Protocol(TypeAError::Other)),
-            }
-        }
+        collect_response_with(
+            self.transceiver,
+            &mut self.handler,
+            self.hw_crc,
+            first,
+        )
     }
 
     /// Transceive with error recovery per §7.5.5.
@@ -252,61 +397,23 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
         block: &Block,
         receiving_chain: bool,
     ) -> Result<Block, PcdError<T::Error>> {
-        match self.transceive_block(block) {
-            Ok(resp) => Ok(resp),
-            Err(_) => {
-                let mut retries = 0;
-                loop {
-                    if retries >= MAX_RETRIES {
-                        return Err(PcdError::Protocol(TypeAError::Other));
-                    }
-                    retries += 1;
-
-                    let recovery = if receiving_chain {
-                        self.handler.build_rack()?
-                    } else {
-                        self.handler.build_rnak()?
-                    };
-
-                    match self.transceive_block(&recovery) {
-                        Ok(resp) => return Ok(resp),
-                        Err(_) => continue,
-                    }
-                }
-            }
-        }
+        transceive_with_recovery_with(
+            self.transceiver,
+            &mut self.handler,
+            self.hw_crc,
+            block,
+            receiving_chain,
+        )
     }
 
     /// Send a block via the transceiver and parse the response.
     fn transceive_block(&mut self, block: &Block) -> Result<Block, PcdError<T::Error>> {
-        let data = block.to_bytes_without_crc()?;
-        let frame = if self.hw_crc {
-            Frame::Standard(data)
-        } else {
-            Frame::Standard(append_crc_a(&data)?)
-        };
-
-        let resp = self
-            .transceiver
-            .transceive(&frame)
-            .map_err(PcdError::PcdTransceiver)?;
-
-        self.parse_block_response(&resp)
+        transceive_block_with(self.transceiver, self.hw_crc, block)
     }
 
     /// Parse a raw response into a Block, handling the CRC strategy.
     fn parse_block_response(&self, raw: &[u8]) -> Result<Block, PcdError<T::Error>> {
-        if self.hw_crc {
-            // HW already validated and stripped CRC; append (0,0) so
-            // Block::try_from accepts it (it treats (0,0) as valid).
-            let mut buf = FrameVec::new();
-            buf.try_extend(raw)?;
-            buf.try_push(0)?;
-            buf.try_push(0)?;
-            Ok(Block::try_from(buf.as_slice())?)
-        } else {
-            Ok(Block::try_from(raw)?)
-        }
+        parse_block_response(self.hw_crc, raw)
     }
 }
 
@@ -330,6 +437,7 @@ mod tests {
         responses: Vec<FrameVec>,
         sent: Vec<FrameVec>,
         call_idx: usize,
+        fail_at: Option<usize>,
     }
 
     impl MockTransceiver {
@@ -339,7 +447,13 @@ mod tests {
                 responses,
                 sent: Vec::new(),
                 call_idx: 0,
+                fail_at: None,
             }
+        }
+
+        fn with_failure_at(mut self, idx: usize) -> Self {
+            self.fail_at = Some(idx);
+            self
         }
     }
 
@@ -361,7 +475,11 @@ mod tests {
         }
 
         fn try_enable_hw_crc(&mut self) -> Result<(), MockError> {
-            if self.hw_crc { Ok(()) } else { Err(MockError) }
+            if self.hw_crc {
+                Ok(())
+            } else {
+                Err(MockError)
+            }
         }
     }
 
