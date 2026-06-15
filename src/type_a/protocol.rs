@@ -147,9 +147,11 @@ impl ProtocolHandler {
         self.chain.try_extend(block.payload.as_slice())?;
 
         if block.is_chaining() {
-            // R(ACK) carries the received block's number (before toggle)
-            let rack = self.build_rack()?;
+            // ISO 14443-4 §7.5.4: R(ACK) must carry the *next* expected BN
+            // (the toggled value). Sending the same BN as the received I-block
+            // would signal "retransmit" to the PICC.
             self.toggle_block_number();
+            let rack = self.build_rack()?;
             Ok(Action::Reply(rack))
         } else {
             self.toggle_block_number();
@@ -321,6 +323,9 @@ mod tests {
             Action::Reply(reply) => {
                 assert_eq!(reply.block_type(), BlockType::RBlock);
                 assert_eq!(reply.pcb.r_subtype, Some(RBlockSubtype::Ack));
+                // R(ACK) must carry the *next* expected BN (toggled), not the
+                // received BN. Receiving BN=0 → R(ACK) BN=1.
+                assert_eq!(reply.block_number(), 1);
             }
             other => panic!("expected Reply(R(ACK)), got {:?}", other),
         }
