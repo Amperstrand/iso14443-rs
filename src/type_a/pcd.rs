@@ -78,12 +78,11 @@ fn connect_session<T: PcdTransceiver>(
         .transceive(&Frame::Standard(data))
         .map_err(PcdError::PcdTransceiver)?;
 
+    // The transceiver already validated and stripped the CRC in the
+    // hardware-CRC path — parse the CRC-verified body directly instead of
+    // fabricating dummy CRC bytes (SFT-7605).
     let ats = if hw_crc {
-        let mut buf = FrameVec::new();
-        buf.try_extend(resp.as_slice())?;
-        buf.try_push(0)?;
-        buf.try_push(0)?;
-        Ats::try_from(buf.as_slice())?
+        Ats::from_crc_verified(resp.as_slice())?
     } else {
         Ats::try_from(resp.as_slice())?
     };
@@ -92,12 +91,11 @@ fn connect_session<T: PcdTransceiver>(
 }
 
 fn parse_block_response<E>(hw_crc: bool, raw: &[u8]) -> Result<Block, PcdError<E>> {
+    // The transceiver already validated and stripped the CRC in the
+    // hardware-CRC path — parse the CRC-verified body directly instead of
+    // fabricating dummy CRC bytes (SFT-7605).
     if hw_crc {
-        let mut buf = FrameVec::new();
-        buf.try_extend(raw)?;
-        buf.try_push(0)?;
-        buf.try_push(0)?;
-        Ok(Block::try_from(buf.as_slice())?)
+        Ok(Block::from_crc_verified(raw)?)
     } else {
         Ok(Block::try_from(raw)?)
     }
@@ -377,11 +375,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
 
         // Validate PPS response
         if self.hw_crc {
-            let mut buf = FrameVec::new();
-            buf.try_extend(resp.as_slice())?;
-            buf.try_push(0)?;
-            buf.try_push(0)?;
-            let _ = PpsResp::try_from(buf.as_slice())?;
+            let _ = PpsResp::from_crc_verified(resp.as_slice())?;
         } else {
             let _ = PpsResp::try_from(resp.as_slice())?;
         };
@@ -551,12 +545,12 @@ mod tests {
     }
 
     fn minimal_ats() -> Ats {
-        let raw = &[0x05, 0x78, 0x80, 0x40, 0x02, 0x00, 0x00];
+        let raw = append_crc_a(&[0x05, 0x78, 0x80, 0x40, 0x02]).unwrap();
         Ats::try_from(raw.as_slice()).unwrap()
     }
 
     fn small_fsc_ats() -> Ats {
-        let raw = &[0x05, 0x70, 0x80, 0x40, 0x02, 0x00, 0x00];
+        let raw = append_crc_a(&[0x05, 0x70, 0x80, 0x40, 0x02]).unwrap();
         Ats::try_from(raw.as_slice()).unwrap()
     }
 
@@ -694,5 +688,58 @@ mod tests {
         let (_pcd, ats) = Pcd::connect(&mut t, Fsdi::Fsd256, Cid::new(0).unwrap()).unwrap();
         assert_eq!(ats.length, 1);
         assert_eq!(ats.format.fsci.fsc(), 32);
+    }
+
+    #[test]
+    fn sw_crc_rejects_zero_crc_response() {
+        // Software CRC mode: an I-Block ending in 00 00 is not exempt from
+        // the CRC check just because the bytes are zero.
+        let block = Block::new(Pcb::new(BlockType::IBlock).with_block_number(0))
+            .with_payload(frame_vec(&[0xAA, 0xBB]));
+        let mut raw = block.to_bytes_without_crc().unwrap();
+        raw.try_push(0).unwrap();
+        raw.try_push(0).unwrap();
+
+        let mut t = MockTransceiver::new(false, vec![raw]);
+        let ats = minimal_ats();
+        let mut pcd = Pcd::new(&mut t, &ats, None, false);
+
+        match pcd.exchange(&[0x01]) {
+            Err(PcdError::Protocol(TypeAError::InvalidCrc(_))) => {}
+            other => panic!("expected Protocol(InvalidCrc), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sw_crc_accepts_correct_crc_response() {
+        let resp = mock_iblock_response(0, &[0xAA, 0xBB], false);
+        let mut t = MockTransceiver::new(false, vec![resp]);
+        let ats = minimal_ats();
+        let mut pcd = Pcd::new(&mut t, &ats, None, false);
+
+        assert_eq!(pcd.exchange(&[0x01]).unwrap().as_slice(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn sw_crc_rejects_zero_crc_ats() {
+        // The same goes for the ATS returned to RATS.
+        let mut raw = frame_vec(&[0x05, 0x78, 0x80, 0x40, 0x02]);
+        raw.try_push(0).unwrap();
+        raw.try_push(0).unwrap();
+        let mut t = MockTransceiver::new(false, vec![raw]);
+
+        match Pcd::connect(&mut t, Fsdi::Fsd256, Cid::new(0).unwrap()) {
+            Err(PcdError::Protocol(TypeAError::InvalidCrc(_))) => {}
+            other => panic!("expected Protocol(InvalidCrc), got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn hw_crc_takes_crc_free_frames() {
+        // Hardware CRC mode: the same CRC-free bytes are parsed through the
+        // verified-input API, no synthesized epilogue involved.
+        let mut t = MockTransceiver::new(true, vec![frame_vec(&[0x05, 0x78, 0x80, 0x40, 0x02])]);
+        let (_pcd, ats) = Pcd::connect(&mut t, Fsdi::Fsd256, Cid::new(0).unwrap()).unwrap();
+        assert_eq!(ats.length, 5);
     }
 }
