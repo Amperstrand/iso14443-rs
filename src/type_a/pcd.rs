@@ -510,11 +510,7 @@ mod tests {
         }
 
         fn try_enable_hw_crc(&mut self) -> Result<(), MockError> {
-            if self.hw_crc {
-                Ok(())
-            } else {
-                Err(MockError)
-            }
+            if self.hw_crc { Ok(()) } else { Err(MockError) }
         }
     }
 

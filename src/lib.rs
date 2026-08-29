@@ -38,6 +38,8 @@
 //! `#![no_std]` by default (uses `heapless` with fixed-size buffers).
 
 #![no_std]
+#![allow(dead_code)]
+#![allow(clippy::result_unit_err)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
