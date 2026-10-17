@@ -72,6 +72,17 @@ pub trait PcdTransceiver {
     ///   still carry their CRC_A and are parsed with `TryFrom<&[u8]>`, which
     ///   checks it.
     fn try_enable_hw_crc(&mut self) -> Result<(), Self::Error>;
+
+    /// Extend the receive timeout for S(WTX) exchanges.
+    ///
+    /// Called before sending an S(WTX) echo to give the card the additional
+    /// processing time it requested (ISO 14443-4 §7.5.7).  The default
+    /// implementation is a no-op; hardware transceivers should override it.
+    ///
+    /// Returns `Ok(())` if the timeout was updated, `Err(())` otherwise.
+    fn try_set_timeout_ms(&mut self, _ms: u32) -> Result<(), ()> {
+        Err(())
+    }
 }
 
 /// Trait for ISO14443 Type A PICC (card emulation) transceiver hardware.
@@ -307,7 +318,7 @@ pub use ats::{Fsci, Fwi, Sfgi, Ta, Tb, Tc};
 pub use block::Block;
 pub use limits::{Limit, Limits};
 pub use pcb::{BlockType, Pcb, PcbFlags, RBlockSubtype, SBlockSubtype};
-pub use pcd::{Pcd, PcdError};
+pub use pcd::{Pcd, PcdError, PcdSession};
 pub use picc::{Picc, PiccConfig, PiccError, Uid};
 pub use pps::Dxi;
 pub use protocol::{Action, ProtocolHandler, Role};

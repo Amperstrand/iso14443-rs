@@ -43,21 +43,36 @@ impl<E> From<TypeAError> for PcdError<E> {
 #[derive(Debug)]
 pub struct Pcd<'t, T: PcdTransceiver> {
     transceiver: &'t mut T,
+    pub session: PcdSession,
+}
+
+/// The borrow-free half of [`Pcd`]: all protocol state for a single
+/// activated PICC (CRC strategy, negotiated frame sizes, handler), held
+/// separately so callers that manage the transceiver themselves can drive
+/// exchanges without the lifetime knot.
+#[derive(Debug)]
+pub struct PcdSession {
     hw_crc: bool,
     /// Maximum frame size the PICC accepts (from ATS FSCI).
     fsc: usize,
     /// Maximum frame size we told the PICC we accept (from RATS FSDI).
     fsd: usize,
     handler: ProtocolHandler,
+    /// Base frame waiting time (FWT) in ms; S(WTX) requests extend the
+    /// transceiver timeout to WTXM x FWT (ISO 14443-4 §7.5.7).
+    base_fwt_ms: u32,
 }
 
-impl<'t, T: PcdTransceiver> Pcd<'t, T> {
-    /// Full setup: probe hardware CRC, send RATS, parse ATS, return a
-    /// ready session and the parsed ATS for inspection.
-    pub fn connect(t: &'t mut T, fsdi: Fsdi, cid: Cid) -> Result<(Self, Ats), PcdError<T::Error>> {
+impl PcdSession {
+    /// Full setup over a caller-owned transceiver: probe hardware CRC, send
+    /// RATS, parse the ATS, and return the borrow-free session state.
+    pub fn from_connect<T: PcdTransceiver>(
+        t: &mut T,
+        fsdi: Fsdi,
+        cid: Cid,
+    ) -> Result<(Self, Ats), PcdError<T::Error>> {
         let hw_crc = t.try_enable_hw_crc().is_ok();
 
-        // Build and send RATS
         let rats = RatsParam::new(fsdi, cid);
         let rats_byte = u8::from(&rats);
         let data = if hw_crc {
@@ -73,23 +88,101 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
             .transceive(&Frame::Standard(data))
             .map_err(PcdError::PcdTransceiver)?;
 
-        // Parse ATS — the transceiver already checked and stripped the CRC
-        // in the hardware-CRC path
         let ats = if hw_crc {
             Ats::from_crc_verified(resp.as_slice())?
         } else {
             Ats::try_from(resp.as_slice())?
         };
 
-        let fsc = ats.format.fsci.fsc();
+        Ok((
+            Self {
+                hw_crc,
+                fsc: ats.format.fsci.fsc(),
+                fsd: fsdi.fsd(),
+                handler: ProtocolHandler::new(Role::Pcd, Some(cid)),
+                base_fwt_ms: 0,
+            },
+            ats,
+        ))
+    }
 
+    /// Manual construction for callers that already handled RATS/ATS
+    /// externally. The FSD ceiling defaults to the ATS's FSCI — callers
+    /// that announced a smaller FSD should take the `from_connect` path.
+    pub fn from_ats(ats: &Ats, cid: Option<Cid>, hw_crc: bool) -> Self {
+        Self {
+            hw_crc,
+            fsc: ats.format.fsci.fsc(),
+            fsd: ats.format.fsci.fsc(),
+            handler: ProtocolHandler::new(Role::Pcd, cid),
+            base_fwt_ms: 0,
+        }
+    }
+
+    pub fn set_base_fwt_ms(&mut self, ms: u32) {
+        self.base_fwt_ms = ms;
+    }
+
+    fn empty() -> Self {
+        Self {
+            hw_crc: false,
+            fsc: 0,
+            fsd: 0,
+            handler: ProtocolHandler::new(Role::Pcd, None),
+            base_fwt_ms: 0,
+        }
+    }
+
+    /// Exchange an APDU with the PICC over a caller-owned transceiver —
+    /// the borrow-free counterpart of [`Pcd::exchange`]. Session state
+    /// (chaining, block number, counters) is preserved across the call
+    /// and restored on error paths too.
+    pub fn exchange<T: PcdTransceiver>(
+        &mut self,
+        t: &mut T,
+        apdu: &[u8],
+    ) -> Result<ChainVec, PcdError<T::Error>> {
+        let session = core::mem::replace(self, PcdSession::empty());
+        let mut pcd = Pcd {
+            transceiver: t,
+            session,
+        };
+        let result = pcd.exchange(apdu);
+        *self = core::mem::replace(&mut pcd.session, PcdSession::empty());
+        result
+    }
+
+    /// Deselect the PICC over a caller-owned transceiver — the borrow-free
+    /// counterpart of [`Pcd::deselect`].
+    pub fn deselect<T: PcdTransceiver>(&mut self, t: &mut T) -> Result<(), PcdError<T::Error>> {
+        let session = core::mem::replace(self, PcdSession::empty());
+        let mut pcd = Pcd {
+            transceiver: t,
+            session,
+        };
+        let result = pcd.deselect();
+        *self = core::mem::replace(&mut pcd.session, PcdSession::empty());
+        result
+    }
+
+    pub fn hw_crc(&self) -> bool {
+        self.hw_crc
+    }
+
+    pub fn set_fsc(&mut self, fsc: usize) {
+        self.fsc = fsc;
+    }
+}
+
+impl<'t, T: PcdTransceiver> Pcd<'t, T> {
+    /// Full setup: probe hardware CRC, send RATS, parse ATS, return a
+    /// ready session and the parsed ATS for inspection.
+    pub fn connect(t: &'t mut T, fsdi: Fsdi, cid: Cid) -> Result<(Self, Ats), PcdError<T::Error>> {
+        let (session, ats) = PcdSession::from_connect(t, fsdi, cid)?;
         Ok((
             Self {
                 transceiver: t,
-                hw_crc,
-                fsc,
-                fsd: fsdi.fsd(),
-                handler: ProtocolHandler::new(Role::Pcd, Some(cid)),
+                session,
             },
             ats,
         ))
@@ -107,28 +200,28 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
         cid: Option<Cid>,
         hw_crc: bool,
     ) -> Self {
+        let mut session = PcdSession::from_ats(ats, cid, hw_crc);
+        session.fsd = fsdi.fsd();
         Self {
             transceiver,
-            hw_crc,
-            fsc: ats.format.fsci.fsc(),
-            fsd: fsdi.fsd(),
-            handler: ProtocolHandler::new(Role::Pcd, cid),
+            session,
         }
     }
 
     /// The work limits applied to each exchange.
     pub fn limits(&self) -> &Limits {
-        self.handler.limits()
+        self.session.handler.limits()
     }
 
     /// Replace the work limits. Takes effect on the next exchange.
     pub fn set_limits(&mut self, limits: Limits) {
-        self.handler.set_limits(limits);
+        self.session.handler.set_limits(limits);
     }
 
     /// Negotiate bit rates via PPS (optional, call after connect/new).
     pub fn pps(&mut self, dri: Dxi, dsi: Dxi) -> Result<(), PcdError<T::Error>> {
         let cid = self
+            .session
             .handler
             .build_rack()
             .ok()
@@ -138,7 +231,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
         let pps1 = u8::from(&param);
         let cid_byte = 0xd0 + u8::from(&cid);
 
-        let data = if self.hw_crc {
+        let data = if self.session.hw_crc {
             let mut v = FrameVec::new();
             v.try_push(cid_byte)?;
             v.try_push(0x11)?;
@@ -154,7 +247,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
             .map_err(PcdError::PcdTransceiver)?;
 
         // Validate PPS response
-        if self.hw_crc {
+        if self.session.hw_crc {
             let _ = PpsResp::from_crc_verified(resp.as_slice())?;
         } else {
             let _ = PpsResp::try_from(resp.as_slice())?;
@@ -168,17 +261,17 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// Handles chaining in both directions, S(WTX) responses, and error
     /// recovery per ISO14443-4 §7.5.
     pub fn exchange(&mut self, apdu: &[u8]) -> Result<ChainVec, PcdError<T::Error>> {
-        self.handler.begin_exchange();
+        self.session.handler.begin_exchange();
 
         // Max payload per I-Block: FSC minus prologue (PCB + optional CID)
         // minus epilogue (2-byte CRC).
-        let cid_len = if self.handler.build_iblock(&[], false)?.cid.is_some() {
+        let cid_len = if self.session.handler.build_iblock(&[], false)?.cid.is_some() {
             1
         } else {
             0
         };
         let overhead = 1 + cid_len + 2;
-        let max_inf = self.fsc.saturating_sub(overhead);
+        let max_inf = self.session.fsc.saturating_sub(overhead);
         if max_inf == 0 {
             return Err(PcdError::Protocol(TypeAError::Other));
         }
@@ -190,12 +283,15 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
         while offset < apdu.len() {
             let end = core::cmp::min(offset + max_inf, apdu.len());
             let chaining = end < apdu.len();
-            let iblock = self.handler.build_iblock(&apdu[offset..end], chaining)?;
+            let iblock = self
+                .session
+                .handler
+                .build_iblock(&apdu[offset..end], chaining)?;
 
             let resp = self.transceive_block(&iblock)?;
 
             if chaining {
-                match self.handler.process_received(resp)? {
+                match self.session.handler.process_received(resp)? {
                     Action::ChainingAck => {
                         offset = end;
                     }
@@ -221,7 +317,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
 
     /// Send S(DESELECT), wait for response. Retries once per Rule 8.
     pub fn deselect(&mut self) -> Result<(), PcdError<T::Error>> {
-        let deselect = self.handler.build_sblock(SBlockSubtype::Deselect)?;
+        let deselect = self.session.handler.build_sblock(SBlockSubtype::Deselect)?;
 
         match self.transceive_block(&deselect) {
             Ok(ref resp)
@@ -251,10 +347,27 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
         let mut block = first;
 
         loop {
-            match self.handler.process_received(block)? {
+            match self.session.handler.process_received(block)? {
                 Action::Complete(data) => return Ok(data),
                 Action::Reply(reply) => {
-                    block = self.transceive_with_recovery(&reply, true)?;
+                    // S(WTX): the card asked for more processing time —
+                    // extend the transceiver timeout to WTXM x FWT before
+                    // echoing, restore after (ISO 14443-4 §7.5.7). NTAG424
+                    // DNA needs this for MAC / key-diversification work.
+                    let is_wtx = reply.block_type() == BlockType::SBlock
+                        && reply.pcb.s_subtype == Some(SBlockSubtype::Wtx);
+                    if is_wtx && self.session.base_fwt_ms > 0 {
+                        let wtxm = reply.payload.as_slice().first().copied().unwrap_or(1) as u32;
+                        let extended =
+                            (wtxm * self.session.base_fwt_ms).max(self.session.base_fwt_ms);
+                        let _ = self.transceiver.try_set_timeout_ms(extended);
+                        block = self.transceive_with_recovery(&reply, true)?;
+                        let _ = self
+                            .transceiver
+                            .try_set_timeout_ms(self.session.base_fwt_ms);
+                    } else {
+                        block = self.transceive_with_recovery(&reply, true)?;
+                    }
                 }
                 _ => return Err(PcdError::Protocol(TypeAError::Other)),
             }
@@ -282,9 +395,18 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
                     retries += 1;
 
                     let recovery = if receiving_chain {
-                        self.handler.build_rack()?
+                        // ISO 14443-4 §7.5.5 Rule 5: re-send the SAME
+                        // R(ACK). The block number was already toggled by
+                        // process_received, so building a fresh R(ACK) here
+                        // would carry the wrong BN — the card retransmits
+                        // the wrong I-block and chains end up with
+                        // duplicated data (observed on NTAG424 DNA).
+                        match self.transceive_block(block) {
+                            Ok(resp) => return Ok(resp),
+                            Err(_) => continue,
+                        }
                     } else {
-                        self.handler.build_rnak()?
+                        self.session.handler.build_rnak()?
                     };
 
                     match self.transceive_block(&recovery) {
@@ -299,7 +421,7 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// Send a block via the transceiver and parse the response.
     fn transceive_block(&mut self, block: &Block) -> Result<Block, PcdError<T::Error>> {
         let data = block.to_bytes_without_crc()?;
-        let frame = if self.hw_crc {
+        let frame = if self.session.hw_crc {
             Frame::Standard(data)
         } else {
             Frame::Standard(append_crc_a(&data)?)
@@ -318,15 +440,15 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
     /// The RATS told the PICC how large a frame we accept; anything longer
     /// is refused before it is parsed or accumulated.
     fn parse_block_response(&self, raw: &[u8]) -> Result<Block, PcdError<T::Error>> {
-        if self.hw_crc {
+        if self.session.hw_crc {
             // The transceiver already validated the CRC and stripped it, so
             // the frame was two bytes longer on the air
-            if raw.len() + 2 > self.fsd {
+            if raw.len() + 2 > self.session.fsd {
                 return Err(PcdError::Protocol(Limit::FrameSize.into()));
             }
             Ok(Block::from_crc_verified(raw)?)
         } else {
-            if raw.len() > self.fsd {
+            if raw.len() > self.session.fsd {
                 return Err(PcdError::Protocol(Limit::FrameSize.into()));
             }
             Ok(Block::try_from(raw)?)
