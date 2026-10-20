@@ -5,6 +5,10 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # iso14443
 
+> **This is Amperstrand's experimental fork** — a testing/A-B playground we
+> build our projects on. It is not a replacement for upstream; proven work is
+> ported there as small PRs. See [FORK.md](FORK.md).
+
 [![Crates.io](https://img.shields.io/crates/v/iso14443.svg?maxAge=2592000)](https://crates.io/crates/iso14443)
 
 Rust library to manipulate ISO/IEC 14443 data.
