@@ -169,6 +169,19 @@ impl PcdSession {
         self.hw_crc
     }
 
+    /// The work limits applied to each exchange (see [`Limits`]).
+    ///
+    /// Exposed on `PcdSession` for callers that manage their own
+    /// transceiver lifetime (the `Pcd` wrapper delegates here too).
+    pub fn limits(&self) -> &Limits {
+        self.handler.limits()
+    }
+
+    /// Replace the work limits. Takes effect on the next exchange.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.handler.set_limits(limits);
+    }
+
     pub fn set_fsc(&mut self, fsc: usize) {
         self.fsc = fsc;
     }
