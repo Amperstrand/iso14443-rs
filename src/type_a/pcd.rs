@@ -301,18 +301,34 @@ impl<'t, T: PcdTransceiver> Pcd<'t, T> {
                 .handler
                 .build_iblock(&apdu[offset..end], chaining)?;
 
-            let resp = self.transceive_block(&iblock)?;
+            let mut resp = self.transceive_block(&iblock)?;
 
             if chaining {
-                match self.session.handler.process_received(resp)? {
-                    Action::ChainingAck => {
-                        offset = end;
+                loop {
+                    match self.session.handler.process_received(resp)? {
+                        Action::ChainingAck => {
+                            offset = end;
+                            break;
+                        }
+                        Action::ChainingRetransmit => {
+                            // Retransmit same chunk (don't advance offset)
+                            resp = self.transceive_block(&iblock)?;
+                        }
+                        Action::Reply(reply) => {
+                            // ISO 14443-4 §7.5.7: the PICC may answer any
+                            // block expecting a response with S(WTX) —
+                            // including a chained I-block that owes an
+                            // R(ACK). Grant it; the card's answer to the
+                            // grant is the block it owed (or another WTX).
+                            let is_wtx = reply.block_type() == BlockType::SBlock
+                                && reply.pcb.s_subtype == Some(SBlockSubtype::Wtx);
+                            if !is_wtx {
+                                return Err(PcdError::Protocol(TypeAError::Other));
+                            }
+                            resp = self.transceive_block(&reply)?;
+                        }
+                        _ => return Err(PcdError::Protocol(TypeAError::Other)),
                     }
-                    Action::ChainingRetransmit => {
-                        // Retransmit same chunk (don't advance offset)
-                        continue;
-                    }
-                    _ => return Err(PcdError::Protocol(TypeAError::Other)),
                 }
             } else {
                 // The PICC answers the last chunk with an I-Block carrying
@@ -545,6 +561,93 @@ mod tests {
             .with_block_number(block_number)
             .with_r_subtype(RBlockSubtype::Ack);
         Block::new(pcb).to_vec().unwrap()
+    }
+
+    /// #Spec-compliance failing tests (ISO 14443-4 S-block response bit).
+    /// S-blocks have no block number; b1 is the request(0)/response(1)
+    /// indicator: S(WTX response) = 0xF3, S(DESELECT response) = 0xC3.
+
+    fn sent_pcb_bytes(t: &MockTransceiver, idx: usize) -> u8 {
+        t.sent[idx].as_slice()[0]
+    }
+
+    #[test]
+    fn wtx_grant_is_response_encoded() {
+        // A card asks for time before answering; the grant the PCD sends
+        // MUST be S(WTX response) with b1 = 1 (0xF3).
+        let mut t = MockTransceiver::new(
+            false,
+            vec![
+                mock_wtx_request(0x01),
+                mock_iblock_response(0, &[0x90, 0x00], false),
+            ],
+        );
+        let ats = minimal_ats();
+        let mut pcd = Pcd::new(&mut t, &ats, Fsdi::Fsd256, None, false);
+        pcd.exchange(&[0x01]).expect("exchange completes");
+        let grant = sent_pcb_bytes(&t, 1);
+        assert_eq!(
+            grant, 0xF3,
+            "WTX grant must be the S(WTX response) encoding (b1=1)"
+        );
+    }
+
+    #[test]
+    fn wtx_grant_b1_is_state_independent() {
+        // b1 on S-blocks must NEVER leak the I/R block-number counter:
+        // run one exchange first (toggles the counter), then a WTX.
+        let mut t = MockTransceiver::new(
+            false,
+            vec![
+                mock_iblock_response(0, &[0x90, 0x00], false),
+                mock_wtx_request(0x02),
+                mock_iblock_response(1, &[0x90, 0x00], false),
+            ],
+        );
+        let ats = minimal_ats();
+        let mut pcd = Pcd::new(&mut t, &ats, Fsdi::Fsd256, None, false);
+        pcd.exchange(&[0x01]).expect("first exchange");
+        pcd.exchange(&[0x02]).expect("second exchange");
+        let grant = sent_pcb_bytes(&t, 2);
+        assert_eq!(
+            grant, 0xF3,
+            "grant byte must not depend on block-number state"
+        );
+    }
+
+    #[test]
+    fn mid_chain_wtx_is_granted_and_chain_completes() {
+        // ISO 14443-4 §7.5.7: the PICC may answer ANY block expecting a
+        // response with S(WTX) — including a chained I-block that owes an
+        // R(ACK). The reader must grant and continue the chain. Script:
+        // WTX in answer to the FIRST chained block, then the R(ACK), then
+        // the final block's response.
+        let mut t = MockTransceiver::new(
+            false,
+            vec![
+                mock_wtx_request(0x01), // answers chained I-block #1 (bn=0)
+                mock_rack_response(0),  // the owed ack (echoes bn=0)
+                mock_rack_response(1),  // ack of block #2 (bn=1)
+                mock_rack_response(0),  // ack of block #3 (bn=0)
+                mock_iblock_response(1, &[0x90, 0x00], false), // final (bn=1)
+            ],
+        );
+        let ats = small_fsc_ats(); // FSC 16 -> forces chaining
+        let mut pcd = Pcd::new(&mut t, &ats, Fsdi::Fsd16, None, false);
+        let got = pcd
+            .exchange(&[0xAA; 40])
+            .expect("chained exchange must survive mid-chain WTX");
+        assert_eq!(got.as_slice(), &[0x90, 0x00]);
+        // Every INF byte must have been delivered exactly once.
+        let inf: usize = t
+            .sent
+            .iter()
+            .map(|f| f.as_slice().len().saturating_sub(3))
+            .sum();
+        assert!(
+            inf >= 40,
+            "chain must have delivered the full APDU (saw {inf} payload bytes)"
+        );
     }
 
     fn mock_wtx_request(wtxm: u8) -> FrameVec {

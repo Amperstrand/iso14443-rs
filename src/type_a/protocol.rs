@@ -213,7 +213,10 @@ impl ProtocolHandler {
     }
 
     pub fn build_wtx_response(&self, request: &Block) -> Result<Block, TypeAError> {
-        let pcb = Pcb::new(BlockType::SBlock).with_s_subtype(SBlockSubtype::Wtx);
+        // Reply: b1 = 1 (S(WTX response) = 0xF3).
+        let pcb = Pcb::new(BlockType::SBlock)
+            .with_s_subtype(SBlockSubtype::Wtx)
+            .with_s_response(true);
         let mut block = Block::new(pcb);
         if let Some(cid) = self.cid {
             block = block.with_cid(cid);
@@ -343,7 +346,8 @@ impl ProtocolHandler {
                 Ok(Action::Reply(resp))
             }
             Some(SBlockSubtype::Deselect) => {
-                let resp = self.build_sblock(SBlockSubtype::Deselect)?;
+                let mut resp = self.build_sblock(SBlockSubtype::Deselect)?;
+                resp.pcb.s_response = true; // reply: b1 = 1 (0xC3)
                 self.reset();
                 Ok(Action::Reply(resp))
             }
