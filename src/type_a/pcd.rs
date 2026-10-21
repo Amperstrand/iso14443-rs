@@ -563,9 +563,13 @@ mod tests {
         Block::new(pcb).to_vec().unwrap()
     }
 
-    /// #Spec-compliance failing tests (ISO 14443-4 S-block response bit).
-    /// S-blocks have no block number; b1 is the request(0)/response(1)
-    /// indicator: S(WTX response) = 0xF3, S(DESELECT response) = 0xC3.
+    /// WTX-grant encoding tests. INTEROP FINDING (2026-10-21, wire-
+    /// proven on J3R180 batch-kin, capture in ccid-firmware-rs#378):
+    /// the deployed card population REJECTS the spec-correct
+    /// S(WTX response) encoding (b1=1, 0xF2) — the card goes silent
+    /// after a 0xF2 grant. The grant therefore echoes the request
+    /// encoding (0xF2 + WTXM); the b1 model remains for opt-in strict
+    /// mode. These tests pin the interop contract.
 
     fn sent_pcb_bytes(t: &MockTransceiver, idx: usize) -> u8 {
         t.sent[idx].as_slice()[0]
@@ -574,7 +578,7 @@ mod tests {
     #[test]
     fn wtx_grant_is_response_encoded() {
         // A card asks for time before answering; the grant the PCD sends
-        // MUST be S(WTX response) with b1 = 1 (0xF3).
+        // must be the request-form echo (0xF2) — J3R180 interop.
         let mut t = MockTransceiver::new(
             false,
             vec![
@@ -587,8 +591,8 @@ mod tests {
         pcd.exchange(&[0x01]).expect("exchange completes");
         let grant = sent_pcb_bytes(&t, 1);
         assert_eq!(
-            grant, 0xF3,
-            "WTX grant must be the S(WTX response) encoding (b1=1)"
+            grant, 0xF2,
+            "grant must be the request-form echo (J3R180 interop)"
         );
     }
 
@@ -610,7 +614,7 @@ mod tests {
         pcd.exchange(&[0x02]).expect("second exchange");
         let grant = sent_pcb_bytes(&t, 2);
         assert_eq!(
-            grant, 0xF3,
+            grant, 0xF2,
             "grant byte must not depend on block-number state"
         );
     }

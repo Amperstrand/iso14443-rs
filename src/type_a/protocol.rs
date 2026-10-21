@@ -213,10 +213,14 @@ impl ProtocolHandler {
     }
 
     pub fn build_wtx_response(&self, request: &Block) -> Result<Block, TypeAError> {
-        // Reply: b1 = 1 (S(WTX response) = 0xF3).
-        let pcb = Pcb::new(BlockType::SBlock)
-            .with_s_subtype(SBlockSubtype::Wtx)
-            .with_s_response(true);
+        // INTEROP (wire-proven 2026-10-21, J3R180 batch-kin): the
+        // spec-correct response encoding (b1=1, 0xF3) is REJECTED by
+        // the deployed card population — after a 0xF3 grant the card
+        // goes silent and the exchange dies (netlog capture in
+        // Amperstrand/ccid-firmware-rs#378). Cards accept the
+        // request-form echo (0xF2 + WTXM). Keep b1=0 on the grant;
+        // the s_response model stays for future strict-mode opt-in.
+        let pcb = Pcb::new(BlockType::SBlock).with_s_subtype(SBlockSubtype::Wtx);
         let mut block = Block::new(pcb);
         if let Some(cid) = self.cid {
             block = block.with_cid(cid);
