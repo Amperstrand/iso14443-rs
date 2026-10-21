@@ -46,6 +46,8 @@ pub struct Pcb {
     pub chaining: bool,
     pub r_subtype: Option<RBlockSubtype>,
     pub s_subtype: Option<SBlockSubtype>,
+    /// S-block only: b1 = response indicator (never a block number).
+    pub s_response: bool,
 }
 
 impl fmt::Debug for Pcb {
@@ -73,7 +75,16 @@ impl Pcb {
             chaining: false,
             r_subtype: None,
             s_subtype: None,
+            s_response: false,
         }
+    }
+
+    /// ISO 14443-4 S-blocks have no block number: b1 is the
+    /// request(0)/response(1) indicator (S(WTX resp) = 0xF3,
+    /// S(DESELECT resp) = 0xC3). Only meaningful for SBlocks.
+    pub fn with_s_response(mut self, response: bool) -> Self {
+        self.s_response = response;
+        self
     }
 
     pub fn with_block_number(mut self, block_number: u8) -> Self {
@@ -170,7 +181,10 @@ impl TryFrom<u8> for Pcb {
             return Err(crate::type_a::TypeAError::InvalidPcb);
         }
 
-        let block_number = if flags.contains(PcbFlags::BLOCK_NUMBER) {
+        let s_response = block_type == BlockType::SBlock && flags.contains(PcbFlags::BLOCK_NUMBER);
+        let block_number = if block_type == BlockType::SBlock {
+            0
+        } else if flags.contains(PcbFlags::BLOCK_NUMBER) {
             1
         } else {
             0
@@ -214,6 +228,7 @@ impl TryFrom<u8> for Pcb {
             chaining,
             r_subtype,
             s_subtype,
+            s_response,
         })
     }
 }
@@ -229,9 +244,19 @@ impl From<Pcb> for u8 {
             BlockType::SBlock => byte |= 0b1100_0000,
         }
 
-        // Set block number (bit 0)
-        if pcb.block_number.get() == 1 {
-            byte |= PcbFlags::BLOCK_NUMBER.bits();
+        // Bit 0: block number for I/R blocks; response indicator for
+        // S-blocks (they carry no block number — ISO 14443-4 Table 3).
+        match pcb.block_type {
+            BlockType::SBlock => {
+                if pcb.s_response {
+                    byte |= 0b0000_0001;
+                }
+            }
+            _ => {
+                if pcb.block_number.get() == 1 {
+                    byte |= PcbFlags::BLOCK_NUMBER.bits();
+                }
+            }
         }
 
         // Set chaining bit (bit 4) - only for I-blocks
